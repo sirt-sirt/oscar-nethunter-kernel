@@ -1,71 +1,100 @@
 <div align="center">
-  <h1>NetHunter Custom Kernel</h1>
-  <h3>Realme 9 Pro 5G (oscar)</h3>
-  
-  <p>
-    <a href="https://github.com/sirt-sirt/oscar-nethunter-custom_kernel/actions/workflows/build-kernel.yml">
-      <img src="https://github.com/sirt-sirt/oscar-nethunter-custom_kernel/actions/workflows/build-kernel.yml/badge.svg" alt="Build Status">
-    </a>
-  </p>
+
+# NetHunter Kernel · Realme 9 Pro 5G (`oscar`)
+
+**Кастомное ядро Linux 5.4.280-qgki для Kali NetHunter — прошито и проверено на живом железе**
+
+[![Build](https://github.com/sirt-sirt/oscar-nethunter-kernel/actions/workflows/build-kernel.yml/badge.svg)](https://github.com/sirt-sirt/oscar-nethunter-kernel/actions/workflows/build-kernel.yml)
+[![License](https://img.shields.io/badge/license-GPL--2.0-blue)](LICENSE)
+![Kernel](https://img.shields.io/badge/kernel-5.4.280--qgki-green)
+![CFI](https://img.shields.io/badge/CFI-strict%20·%20passing-success)
+
 </div>
 
 ---
 
-## Поддерживаемые устройства
-* **Устройство:** Realme 9 Pro 5G
-* **Кодовое имя:** `oscar` (RMX3471 / RMX3472)
-* **Процессор:** Qualcomm Snapdragon 695 5G (`sm6375` / `holi`)
-* **Базовая прошивка:** LineageOS 21 (Android 14)
-* **Версия ядра:** Linux 5.4.280-qgki
+## Что это
 
----
+Кастомное ядро для **Realme 9 Pro 5G** (кодовое имя `oscar`, SoC Qualcomm Snapdragon 695 5G / `sm6375` / `holi`, база LineageOS 21 / Android 14), превращающее телефон в полноценную платформу **Kali NetHunter**:
 
-## Особенности (Патчи NetHunter)
+- полноценный Kali chroot (namespaces, SysVIPC);
+- хакерское железо по USB OTG;
+- **monitor mode + packet injection** через внешний Wi-Fi-свисток.
 
-Данное ядро было модифицировано специально для проведения аудита информационной безопасности с использованием мобильной платформы **Kali NetHunter**.
+Телефон при этом остаётся телефоном: Wi-Fi, Bluetooth, камера, звук и сотовая сеть работают штатно.
 
-### Поддержка Kali Chroot
-* **System V IPC (`SYSVIPC`)**: Включена поддержка для корректной работы баз данных PostgreSQL и Metasploit.
-* **Linux Namespaces**: Активирована полная изоляция (`PID_NS`, `NET_NS`, `USER_NS`, `IPC_NS`, `UTS_NS`) для обеспечения работоспособности chroot-окружения NetHunter и выполнения операций без root-прав в рамках контейнера.
+## Ключевые особенности
 
-### Беспроводные сети и пакетные инъекции (Monitor Mode)
-* **Wireless Extensions (`CFG80211_WEXT`)**: Включена совместимость со старыми API, необходимыми для работы утилит `airodump-ng` и `aireplay-ng`.
-* **Поддержка вендора Realtek**: Активированы staging-драйверы для внешних Wi-Fi адаптеров.
-* **Скомпилированные модули**: Драйверы `r8188eu.ko` (TP-Link TL-WN722N v2/v3), `rtl8xxxu.ko` и криптографические библиотеки (`lib80211`) компилируются вместе с ядром и автоматически устанавливаются в систему с помощью AnyKernel3.
+### Совместимость Kali chroot
+`CONFIG_SYSVIPC=y`, полная изоляция namespace'ами (`PID_NS`, `NET_NS`, `USER_NS`, `IPC_NS`, `UTS_NS`) — chroot NetHunter работает без ограничений.
 
-### USB OTG и внешнее оборудование
-* **USB Serial / ACM**: Активированы параметры `CONFIG_USB_ACM` и `CONFIG_USB_SERIAL` для работы с SDR и RFID-оборудованием (Proxmark3, HackRF One).
-* **Серийные адаптеры**: Добавлена поддержка чипов `PL2303`, `FTDI_SIO`, `CH341` и `CP210X` (охватывает большинство внешних беспроводных адаптеров).
-* **Bluetooth**: Параметр `CONFIG_BT_HCIBTUSB` включен для поддержки внешних USB Bluetooth-адаптеров (например, CSR8510). Параметр `BT_BNEP` активирован для сетевой инкапсуляции и Bluetooth-атак.
+### Monitor mode и инжекция
+- Свисток **TP-Link TL-WN722N v2** (чип Realtek **RTL8188EUS**, USB ID `2357:010c`), драйвер — форк aircrack-ng `rtl8188eus`.
+- Драйвер **пропатчен под строгий clang CFI** (xmit-хендлеры → `netdev_tx_t`, tasklet-колбэки → `void f(unsigned long)`, `MODULE_IMPORT_NS`): `CONFIG_CFI_PERMISSIVE` **не нужен**.
+- Живая валидация: инжекция **30/30 = 100 %**, полный WPA-пентест-цикл (monitor → deauth → handshake) без единого CFI-фейла в dmesg.
 
-### Инженерные исправления
-* **Удаление LTO и CFI**: Отключены параметры `CONFIG_LTO_CLANG` и `CONFIG_CFI_CLANG` для устранения критических ошибок линкера `ld.lld: R_AARCH64_ABS32` и обхода жестких проверок Control Flow Integrity, блокирующих пакетные инъекции.
-* **Исправление файловой системы Windows**: Устранены конфликты регистра в подсистеме `net/netfilter` (например, `xt_dscp.c` против `xt_DSCP.c`), возникавшие при клонировании репозитория в ОС Windows, что препятствовало компиляции модуля `iptables`.
-* **Proton Clang**: Ядро скомпилировано с использованием Proton Clang 13.0.0 с принудительным использованием LLVM линкера и ассемблера.
+### Строгий CFI + LTO сохранены
+В отличие от «простых» кастомов, здесь `CONFIG_CFI_CLANG=y + LTO` включены и **проходят** — как у стока Qualcomm. Все out-of-tree правки типизированы честно, касты, глушащие компилятор, удалены.
 
----
+### Инженерная доставка модулей (главное отличие)
+`/vendor/lib/modules` на этом устройстве — **симлинк на read-only раздел `vendor_dlkm` (EROFS)**, поэтому systemless-оверлеи Magisk туда не добивают. Решение:
+
+1. **Все 39 вендорных модулей пересобираются из этого же дерева** (включая Wi-Fi встройки `qcacld-3.0` → `qca_cld3_wlan.ko`) и пакуются в `vendor_dlkm.img` с SELinux-метками (патченный `erofs-utils`).
+2. CI **фатально падает**, если хоть один стоковый модуль остался «стоковым» — с включёнными SYSVIPC/USER_NS сдвигаются CRC `task_struct`, и стоковый модуль не загрузится даже при совпадающем vermagic.
+3. AnyKernel3 трогает только `boot` (подмена ядра, Magisk переживает прошивку), `do.modules=0`.
+4. Драйвер свистка живёт отдельно в `/data/adb/nh/8188eu.ko` и грузится вручную (`insmod` / меню `nh-wifi`) — кривой out-of-tree драйвер по построению не может уронить бут.
+
+## Сборка (GitHub Actions)
+
+Локальная Linux-машина не нужна — всё собирает CI (~26 минут), с гейтами на каждом шаге: проверка release-строки и критичных символов **до** сборки, vermagic каждого `.ko` **после**, сверка с инвентарём 39 модулей устройства, двойная верификация EROFS-образа и готового зипа.
+
+1. Форкните репозиторий.
+2. Вкладка **Actions** → включить workflows.
+3. **Build NetHunter Kernel (oscar)** → *Run workflow*.
+4. Скачать артефакт `NetHunter-Kernel-oscar`.
 
 ## Установка
 
-Ядро упаковано с помощью **AnyKernel3** и устанавливается поверх LineageOS без изменения вендорных разделов и `ocdt`.
+> Требуется разблокированный загрузчик и root (Magisk). Всё, что вы делаете, — на ваш риск.
 
-1. Перейдите на вкладку **[Actions](https://github.com/sirt-sirt/oscar-nethunter-custom_kernel/actions)**.
-2. Выберите последний успешный запуск **Build NetHunter Kernel (oscar)**.
-3. Скачайте артефакт `NetHunter-Kernel-oscar.zip` внизу страницы.
-4. Распакуйте скачанный ZIP-архив **один раз**, чтобы получить внутренний установочный файл `NetHunter-Kernel-oscar.zip`.
-5. Выполните прошивку:
-   * **Lineage Recovery / TWRP:** `Apply Update` -> `Choose from SD card` (или `adb sideload`).
-   * **Magisk:** Модули -> Установить из хранилища.
-6. Перезагрузите устройство.
+1. Скачать артефакт из Actions и **распаковать один раз** — внутри настоящий `NetHunter-Kernel-oscar-*.zip`.
+2. Сделать бэкап текущего `boot`:
+   ```bash
+   su -c 'dd if=/dev/block/by-name/boot$(getprop ro.boot.slot_suffix) of=/sdcard/boot-backup.img'
+   ```
+3. Прошить внутренний zip через **Kernel Flasher** (capntrips) из загруженного Android. Шить **только в активный слот**.
+4. Свисток: скопировать `8188eu.ko` в `/data/adb/nh/`, затем `su -c 'insmod /data/adb/nh/8188eu.ko'`.
 
----
+**Откат:** `fastboot set_active b` (в слоте B остаётся копия рабочего загрузчика) либо `fastboot flash boot boot-backup.img` из fastbootd.
 
-## Компиляция (GitHub Actions)
+### После OTA LineageOS
+OTA перезаписывает `boot` — ядро нужно прошить заново (Magisk → *Install to Inactive Slot (After OTA)* → ребут → Kernel Flasher).
 
-Для сборки ядра локальная Linux-машина не требуется. Процесс полностью автоматизирован через GitHub Actions.
-1. Сделайте форк данного репозитория.
-2. Перейдите на вкладку `Actions` и включите workflows.
-3. Выберите `Build NetHunter Kernel (oscar)` и нажмите **Run workflow**.
-4. Модули `.ko` и бинарный файл ядра `Image` будут автоматически собраны и упакованы в архив AnyKernel3.
+## Использование свистка (в Kali chroot)
 
-> **Примечание:** Скрипт AnyKernel настроен с параметром `do.modules=1`, что обеспечивает автоматическую распаковку и установку внешних Wi-Fi модулей Realtek в системный раздел при прошивке архива.
+```bash
+nh-wifi                       # меню: вкл/выкл/монитор
+airmon-ng start wlan1         # монитоp (в chroot стоит шим против wext-мины ядра 5.4)
+airodump-ng wlan1             # скан
+aireplay-ng -9 -a <BSSID> wlan1   # тест инжекции с явной целью
+```
+
+## Структура репозитория
+
+| Путь | Что это |
+|---|---|
+| `arch/arm64/configs/vendor/nethunter_oscar.config` | конфиг-фрагмент NetHunter поверх `holi-qgki_defconfig` |
+| `nethunter/patch-rtl8188eus.sh` | патчи драйвера свистка под строгий CFI (идемпотентный, loud-fail) |
+| `nethunter/build-vendor-dlkm.sh` | сборка `vendor_dlkm.img` (EROFS + SELinux-метки) |
+| `nethunter/verify-erofs.py` | независимый верификатор EROFS-образа |
+| `nethunter/vendor_dlkm/` | манифест 39 стоковых модулей, `modules.load/softdep/blocklist`, `file_contexts`, `build.prop` |
+| `nethunter/ci/build-kernel.yml` | CI-конвейер |
+| `AnyKernel3/` | упаковка и прошивка |
+
+## Версии
+
+Смотри [Releases](../../releases) — каждый релиз соответствует проверенной на устройстве сборке.
+
+## Лицензия
+
+GPL-2.0 — унаследована от ядра Linux. Проект — для аудита информационной безопасности собственных устройств и сетей.
