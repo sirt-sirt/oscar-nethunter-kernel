@@ -1,0 +1,59 @@
+# The exact set of kernel modules present in /vendor_dlkm/lib/modules on the
+# stock LineageOS 21 build for oscar (RMX3471 / RMX3472), read straight out of
+# an untouched dd of the partition with an EROFS parser. 39 entries.
+#
+# Every one of these is rebuilt from this tree and packed into the vendor_dlkm
+# image we flash. Nothing is "left stock" any more.
+#
+# The reason is CONFIG_SYSVIPC and CONFIG_USER_NS. Both add members to
+# task_struct:
+#     #ifdef CONFIG_SYSVIPC
+#             struct sysv_sem sysvsem;
+#             struct sysv_shm sysvshm;
+#     #endif
+# which shifts the genksyms CRC of every exported symbol whose signature
+# reaches task_struct, cred or nsproxy. A stock module hitting one of those is
+# refused with "disagrees about version of symbol" even though its vermagic
+# string matches byte for byte. Rebuilding all 39 is the only way to keep both
+# the Kali chroot and a working phone.
+#
+# Order here is irrelevant - the boot load order comes from modules.load.
+adsp_loader_dlkm
+apr_dlkm
+aw87xxx_dlkm
+aw882xx_dlkm
+bolero_cdc_dlkm
+bt_fm_slim
+btpower
+camera
+machine_dlkm
+mbhc_dlkm
+native_dlkm
+pa_manager_dlkm
+pinctrl_lpi_dlkm
+platform_dlkm
+q6_dlkm
+q6_notifier_dlkm
+q6_pdr_dlkm
+qca_cld3_wlan
+rdbg
+rmnet_core
+rmnet_ctl
+rmnet_offload
+rmnet_shs
+rx_macro_dlkm
+sia81xx_dlkm
+snd_event_dlkm
+stub_dlkm
+swr_ctrl_dlkm
+swr_dlkm
+tfa98xx-v6_dlkm
+tx_macro_dlkm
+va_macro_dlkm
+wcd937x_dlkm
+wcd937x_slave_dlkm
+wcd938x_dlkm
+wcd938x_slave_dlkm
+wcd9xxx_dlkm
+wcd_core_dlkm
+wsa881x_analog_dlkm

@@ -1,0 +1,849 @@
+# =============================================================================
+# THIS FILE BELONGS AT .github/workflows/build-kernel.yml
+#
+# It is parked here because the GitHub API token these commits were pushed with
+# has no "workflow" scope. GitHub refuses any tree or contents write touching
+# .github/workflows/ with a bare
+#     403 Resource not accessible by integration
+# on both the git/trees and the contents endpoint. Nothing else in this
+# repository is affected - only that one directory.
+#
+# Move it into place from a local clone. Four commands, no editing:
+#
+#     git checkout fix/nethunter-v10-abi
+#     git pull
+#     cp nethunter/ci/build-kernel.yml .github/workflows/build-kernel.yml
+#     git commit -am "ci: build and verify vendor_dlkm.img" && git push
+#
+# On Windows cmd, replace the cp with:
+#     copy /Y nethunter\ci\build-kernel.yml .github\workflows\build-kernel.yml
+#
+# That push starts the build. Do not also press "Run workflow" in the Actions
+# tab - the concurrency group below would cancel one of the two runs and it is
+# not worth guessing which.
+#
+# CHANGES FROM THE VERSION CURRENTLY IN .github/workflows/
+#   * concurrency group, so a second push cancels the first run
+#   * erofs-utils + kmod, and a probe that proves mkfs.erofs can write SELinux
+#     labels BEFORE the 20-minute build, with a --with-selinux source build of
+#     erofs-utils v1.4 as fallback
+#   * modules staged in modout/, not AnyKernel3/modules/ - that directory is
+#     what put 154 MB of inert files into the build-9 zip
+#   * two new steps: build vendor_dlkm.img, then verify it independently
+#   * a device module left stock is a hard failure, not a log line
+#   * vermagic asserted on every module, not on one probe
+#   * MODULE_IMPORT_NS patched into the dongle driver, with the import checked
+#     on the artifact
+#   * the release string asserted against Image with grep -F, so it stops
+#     matching the linux_proc_banner format string "Linux version %s (%s)"
+#   * every "| head -n N" is now "| awk 'NR<=N'" - head closes the pipe early,
+#     grep dies of SIGPIPE, and under pipefail that turned diagnostics into
+#     "Broken pipe" plus a nonzero exit
+#
+# The long-form reasoning behind the config, the partition layout and the
+# verifier lives in arch/arm64/configs/vendor/nethunter_oscar.config,
+# AnyKernel3/anykernel.sh, nethunter/build-vendor-dlkm.sh,
+# nethunter/verify-erofs.py and nethunter-verify-zip.sh. Read those, not this.
+# =============================================================================
+name: Build NetHunter kernel (oscar / SM6375)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "fix/**"
+
+concurrency:
+  group: build-kernel-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ARCH: arm64
+  DEFCONFIG: vendor/holi-qgki_defconfig
+  FRAGMENT: arch/arm64/configs/vendor/nethunter_oscar.config
+
+  # ONE toolchain definition, shared by every make here. Configure and Build
+  # must see the same compiler or the config we gate on is not the config we
+  # build: Kconfig resolves CC_IS_CLANG / CLANG_VERSION / LD_IS_LLD during
+  # olddefconfig, and arch/Kconfig gates LTO_CLANG on all three. Configure with
+  # the default gcc and LTO silently collapses to LTO_NONE, taking CFI_CLANG
+  # with it. The stock kernel is a CFI kernel; mixing gives
+  # "Unknown symbol __cfi_slowpath".
+  KTC: >-
+    LLVM=1 LLVM_IAS=1
+    CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm
+    OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
+    CROSS_COMPILE=aarch64-linux-gnu-
+    CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+  LLVM: 1
+  LLVM_IAS: 1
+
+  # The hash travels in this environment variable, not in a file. Run
+  # 32503060142 proved scripts/setlocalversion never reads .config - it sources
+  # include/config/auto.conf, which syncconfig writes and which was stale. The
+  # script does res="${res}${CONFIG_LOCALVERSION}${LOCALVERSION}", so
+  # CONFIG_LOCALVERSION stays "-qgki" (stale or fresh, auto.conf says the same)
+  # and the hash comes from here. Exporting it also suppresses the trailing "+".
+  LOCALVERSION: "-ge408f03a5c42"
+  EXPECTED_CONFIG_LOCALVERSION: "-qgki"
+
+  # Still reproduced byte for byte, but no longer to let a stock module load -
+  # as of build 10 all 39 are rebuilt here. It matters because /proc/version,
+  # the Kernel Flasher UI and AnyKernel's module remover all key off it.
+  EXPECTED_RELEASE: "5.4.280-qgki-ge408f03a5c42"
+  EXPECTED_VERMAGIC: "5.4.280-qgki-ge408f03a5c42 SMP preempt mod_unload modversions aarch64"
+
+  # 20960 sectors * 512, from lpdump on the device. The image is padded to
+  # exactly this so AnyKernel3's flash_generic writes it in place instead of
+  # resizing a live logical partition.
+  VENDOR_DLKM_SIZE: "10731520"
+
+  KBUILD_BUILD_USER: nethunter
+  KBUILD_BUILD_HOST: builder
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # Runs 32481952672 and 32482784430 died here after ~2 min with
+      #   sh: 1: ../scripts/gcc-version.sh: Permission denied
+      #   init/Kconfig:35: syntax error
+      # Every blob in this repo is mode 100644, and init/Kconfig executes
+      # gcc-version.sh directly; a failed $(shell,...) expansion degenerates
+      # into "default  if CC_IS_GCC". The mode is wrong in the tree and cannot
+      # be fixed through the API these files are pushed with.
+      - name: Restore the executable bit on the build scripts
+        run: |
+          set -eu
+          find . -path ./.git -prune -o -type f \
+            \( -name '*.sh' -o -name '*.pl' -o -name '*.py' \) \
+            -exec chmod +x {} +
+
+          find scripts -type f | while read -r f; do
+            if [ "$(head -c 2 "$f" 2>/dev/null)" = '#!' ]; then
+              chmod +x "$f"
+            fi
+          done
+
+          # Named one by one: Kconfig and the final link invoke these by path,
+          # and a silent miss costs an entire build.
+          fail=0
+          for f in scripts/gcc-version.sh scripts/clang-version.sh \
+                   scripts/gcc-plugin.sh scripts/ld-version.sh \
+                   scripts/tools-support-relr.sh scripts/cc-can-link.sh \
+                   scripts/setlocalversion scripts/mkcompile_h \
+                   scripts/link-vmlinux.sh scripts/depmod.sh \
+                   scripts/kconfig/merge_config.sh \
+                   nethunter/build-vendor-dlkm.sh \
+                   nethunter/patch-rtl8188eus.sh \
+                   nethunter/verify-erofs.py; do
+            if [ ! -e "$f" ]; then
+              echo "  absent  $f"
+            elif [ -x "$f" ]; then
+              echo "  ok +x   $f"
+            else
+              echo "::error::$f is still not executable"
+              fail=1
+            fi
+          done
+          exit "$fail"
+
+      - name: Install build dependencies
+        run: |
+          set -eu
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex make gcc git zip unzip cpio \
+            libssl-dev libelf-dev python3 python-is-python3 \
+            erofs-utils kmod
+
+          echo "=== tools the vendor_dlkm step depends on ==="
+          for t in mkfs.erofs depmod truncate python3; do
+            printf '  %-12s %s\n' "$t" "$(command -v "$t" || echo MISSING)"
+          done
+
+      # BEFORE the 20-minute build, not after. mkfs.erofs accepts
+      # --file-contexts whether or not it was linked against libselinux; if it
+      # was not, it prints nothing and produces an image where every file is
+      # unlabelled. That image mounts, init cannot read a single module, and the
+      # phone boots with no camera, audio, Wi-Fi or Bluetooth - indistinguishable
+      # from an ABI failure. Two seconds here, or a wasted build and flash.
+      - name: Verify mkfs.erofs actually applies SELinux labels
+        run: |
+          set -eu
+          mkfs.erofs -V 2>&1 | awk 'NR<=3' || true
+
+          probe() {
+            rm -rf /tmp/eprobe /tmp/eprobe.img
+            mkdir -p /tmp/eprobe/lib/modules /tmp/eprobe/etc
+            printf 'x' > /tmp/eprobe/lib/modules/probe.ko
+            printf 'x' > /tmp/eprobe/etc/build.prop
+            mkfs.erofs -zlz4hc --all-root \
+              --file-contexts=nethunter/vendor_dlkm/file_contexts \
+              /tmp/eprobe.img /tmp/eprobe > /tmp/eprobe.log 2>&1 || { cat /tmp/eprobe.log; return 1; }
+            cat /tmp/eprobe.log
+            echo "--- HEXDUMP START ---"
+            hexdump -C /tmp/eprobe.img
+            echo "--- HEXDUMP END ---"
+            python3 nethunter/verify-erofs.py dump /tmp/eprobe.img \
+              > /tmp/eprobe.dump 2>&1 || return 1
+            grep -q 'u:object_r:vendor_file:s0'         /tmp/eprobe.dump || return 1
+            grep -q 'u:object_r:vendor_configs_file:s0' /tmp/eprobe.dump || return 1
+          }
+
+          if probe; then
+            echo "  ok      the packaged mkfs.erofs labels files correctly"
+            cat /tmp/eprobe.dump
+            exit 0
+          fi
+
+          echo "### the packaged mkfs.erofs cannot label files - output follows"
+          cat /tmp/eprobe.log  2>/dev/null || true
+          cat /tmp/eprobe.dump 2>/dev/null || true
+
+          # v1.7.1, NOT v1.4. Build 10 proved v1.4 accepts --file-contexts
+          # but never actually calls selabel_lookup — every file comes out
+          # unlabelled. v1.7.1 properly applies labels. The on-disk format
+          # stays compatible with our 5.4 kernel because the new features
+          # (ztailpacking in 1.5, fragments/dedupe in 1.6) are gated behind
+          # explicit -E flags we never pass; with plain -zlz4hc the output
+          # carries feature_incompat 0x1, exactly like the stock partition.
+          # verify-erofs.py asserts on that value and would catch a mismatch.
+          echo "### building erofs-utils v1.7.1 from source with SELinux support"
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake libtool pkg-config \
+            liblz4-dev liblzma-dev zlib1g-dev uuid-dev libselinux1-dev
+
+          rm -rf /tmp/eu
+          git clone --depth=1 -b v1.7.1 \
+            https://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs-utils.git /tmp/eu \
+            || git clone --depth=1 -b v1.7.1 https://github.com/erofs/erofs-utils.git /tmp/eu
+
+          cd /tmp/eu
+          python3 -c "
+          import sys
+          # Patch xattr.c
+          with open('lib/xattr.c', 'r') as f: code = f.read()
+          code = code.replace(
+              'ret = selabel_lookup(cfg.sehnd, &secontext, fspath, mode);',
+              'ret = selabel_lookup(cfg.sehnd, &secontext, fspath, mode);\n\t\tfprintf(stderr, \"DEBUG_SELINUX: fspath=\\x27%s\\x27 mode=%d ret=%d\\\\n\", fspath, (int)mode, ret);\n\t\tif (ret == 0) fprintf(stderr, \"DEBUG_SELINUX: secontext=\\x27%s\\x27\\\\n\", secontext);'
+          )
+          with open('lib/xattr.c', 'w') as f: f.write(code)
+          # Patch config.c
+          with open('lib/config.c', 'r') as f: code = f.read()
+          code = code.replace('{ .type = SELABEL_OPT_PATH, .value = file_contexts }', '{ .type = SELABEL_OPT_PATH, .value = file_contexts }, { .type = 1, .value = (void*)0 }')
+          code = code.replace('seopts, 1', 'seopts, 2')
+          with open('lib/config.c', 'w') as f: f.write(code)
+          "
+          ./autogen.sh
+          ./configure --with-selinux --without-fuse
+          make -j"$(nproc)"
+          sudo install -m 0755 mkfs/mkfs.erofs /usr/local/bin/mkfs.erofs
+          cd "$GITHUB_WORKSPACE"
+
+          hash -r
+          echo "  now using: $(command -v mkfs.erofs)"
+          mkfs.erofs -V 2>&1 | awk 'NR<=3' || true
+
+          if probe; then
+            echo "  ok      the source build labels files correctly"
+            cat /tmp/eprobe.dump
+          else
+            echo "::error::even a --with-selinux source build produced no labels."
+            echo "::error::Stop here. An unlabelled vendor_dlkm image would boot the"
+            echo "::error::phone with no camera, audio, Wi-Fi or Bluetooth."
+            cat /tmp/eprobe.log  2>/dev/null || true
+            cat /tmp/eprobe.dump 2>/dev/null || true
+            exit 1
+          fi
+
+      - name: Fetch Proton Clang
+        run: |
+          set -eu
+          git clone --depth=1 https://github.com/kdrag0n/proton-clang.git "$HOME/tc"
+          echo "$HOME/tc/bin" >> "$GITHUB_PATH"
+
+      # Run 32514819779 died at kernel/module.c:1311 with
+      #   error: non-void function does not return a value [-Werror,-Wreturn-type]
+      # after a sed removed the two "return 1; /* FORCE ACCEPT ALL ... */" lines
+      # that commit eddbb4a had added. Its diff is two pure additions, so
+      # deleting them should have restored the original - and it did not,
+      # because a later commit had gutted both function bodies too. sed cannot
+      # put back code that is no longer in the file. Take the whole file from
+      # the parent of eddbb4a instead; every later edit to it was chasing the
+      # bootloop and made it worse.
+      - name: Restore kernel/module.c from the last clean revision
+        run: |
+          set -eu
+          CLEAN=afaab8dd8cfd1a139f0a5faea2c8e85ba9a474ea
+
+          git fetch --depth=1 origin "$CLEAN" 2>/dev/null \
+            || { git fetch --unshallow origin || true; git fetch origin "$CLEAN"; }
+          git checkout "$CLEAN" -- kernel/module.c
+
+          # Assert on content, not on "sed exited 0". The first two strings live
+          # in check_version(), the third in same_magic() - the code that must
+          # exist for the kernel to refuse a module with wrong CRCs or vermagic.
+          fail=0
+          for s in 'disagrees about version of symbol' \
+                   'no symbol version for' \
+                   'amagic += strcspn(amagic, " ")'; do
+            if grep -qF "$s" kernel/module.c; then
+              echo "  ok      present: $s"
+            else
+              echo "::error::restored kernel/module.c lacks: $s"
+              fail=1
+            fi
+          done
+
+          if grep -q 'FORCE ACCEPT ALL' kernel/module.c; then
+            echo "::error::the force-accept hack is still present"
+            fail=1
+          else
+            echo "  ok      no force-accept hack"
+          fi
+
+          n=$(wc -l < kernel/module.c)
+          echo "  lines   $n in kernel/module.c"
+          if [ "$n" -lt 3000 ]; then
+            echo "::error::kernel/module.c is only $n lines - looks gutted"
+            fail=1
+          fi
+
+          exit "$fail"
+
+      - name: Configure
+        run: |
+          set -eu
+
+          make -j"$(nproc)" O=out ARCH=arm64 $KTC "$DEFCONFIG"
+
+          # CONFIG_LOCALVERSION_AUTO=y would call scm_version() and append a
+          # git hash on top of the LOCALVERSION from the environment, giving a
+          # doubled suffix. The fragment asks for it, this overrides it, and
+          # merge_config.sh prints a "redefined by fragment" notice - expected.
+          printf '%s\n' '# CONFIG_LOCALVERSION_AUTO is not set' > /tmp/release.config
+
+          ARCH=arm64 bash scripts/kconfig/merge_config.sh -m -O out \
+            out/.config "$FRAGMENT" /tmp/release.config
+          make -j"$(nproc)" O=out ARCH=arm64 $KTC olddefconfig
+
+          # syncconfig rewrites include/config/auto.conf and
+          # include/generated/autoconf.h from the merged .config. auto.conf is
+          # what setlocalversion sources and autoconf.h is what the compiler
+          # sees; run 32503060142 shipped a stale pair and that alone produced
+          # the wrong release string.
+          make -j"$(nproc)" O=out ARCH=arm64 $KTC syncconfig
+
+          echo "=== .config vs auto.conf on the release symbols ==="
+          grep -E '^(# )?CONFIG_LOCALVERSION' out/.config || true
+          if [ -f out/include/config/auto.conf ]; then
+            grep -E '^(# )?CONFIG_LOCALVERSION' out/include/config/auto.conf \
+              || echo "  auto.conf carries no LOCALVERSION line"
+            ls -l --time-style=+%H:%M:%S out/.config out/include/config/auto.conf
+          else
+            echo "  auto.conf absent - setlocalversion would have refused to run"
+          fi
+
+          echo "=== toolchain as Kconfig resolved it ==="
+          grep -E '^(# )?CONFIG_(CC_IS_CLANG|CLANG_VERSION|CC_IS_GCC|GCC_VERSION|LD_IS_LLD|LD_VERSION)\b' out/.config || true
+
+          # Positive symbols the fragment asked for that did not survive. A long
+          # list means the fragment is not applying the way we think, and the
+          # gate below would be lying about the cause.
+          echo "=== fragment symbols dropped by olddefconfig ==="
+          dropped=$(grep -E '^CONFIG_[A-Za-z0-9_]+=' "$FRAGMENT" \
+            | grep -v '^CONFIG_LOCALVERSION_AUTO=' \
+            | while IFS= read -r line; do
+                grep -qxF "$line" out/.config || echo "$line"
+              done)
+          if [ -n "$dropped" ]; then
+            printf '%s\n' "$dropped" | sed 's/^/  DROPPED: /'
+            echo "  total dropped: $(printf '%s\n' "$dropped" | wc -l)"
+          else
+            echo "  none - every symbol the fragment asked for survived"
+          fi
+
+          # A "# CONFIG_X is not set" line is silently ignored when X is not
+          # user-settable - a conditional prompt whose condition is false, or a
+          # symbol something else selects. That is why
+          # CFG80211_REQUIRE_SIGNED_REGDB stayed y through nine builds.
+          echo "=== negations the fragment asks for that did NOT stick ==="
+          grep -E '^# CONFIG_[A-Za-z0-9_]+ is not set' "$FRAGMENT" \
+            | sed -E 's/^# (CONFIG_[A-Za-z0-9_]+) is not set/\1/' \
+            | while IFS= read -r sym; do
+                if grep -qE "^${sym}=" out/.config; then
+                  echo "  STILL ON: $(grep -E "^${sym}=" out/.config)"
+                fi
+              done
+          echo "  (end of list)"
+
+      - name: Gate - release string and critical symbols
+        run: |
+          set -eu
+          fail=0
+
+          echo "LOCALVERSION env : [${LOCALVERSION-(unset)}]"
+          if [ "${LOCALVERSION-}" != "-ge408f03a5c42" ]; then
+            echo "::error::LOCALVERSION must be -ge408f03a5c42 in the job environment"
+            fail=1
+          fi
+
+          rel=$(make -s O=out ARCH=arm64 $KTC kernelrelease 2>/dev/null | tail -1)
+          echo "kernelrelease  : $rel"
+          echo "device expects : $EXPECTED_RELEASE"
+          if [ "$rel" != "$EXPECTED_RELEASE" ]; then
+            echo "::error::release mismatch - /proc/version and the AnyKernel module"
+            echo "::error::remover both key off this string."
+            fail=1
+          fi
+
+          # No early exit anywhere in this step. Every failed run costs a round
+          # trip of several minutes, so report everything and exit once.
+          if grep -qx 'CONFIG_LOCALVERSION_AUTO=y' out/.config; then
+            echo "::error::CONFIG_LOCALVERSION_AUTO=y appends a git hash after LOCALVERSION"
+            fail=1
+          else
+            echo "  ok      CONFIG_LOCALVERSION_AUTO is off, as intended"
+          fi
+
+          check() {
+            if ! grep -qx "CONFIG_$1=$2" out/.config; then
+              got=$(grep -E "^(# )?CONFIG_$1[ =]" out/.config || echo "absent")
+              echo "::error::CONFIG_$1 should be $2 but is: $got"
+              fail=1
+            else
+              echo "  ok      CONFIG_$1=$2"
+            fi
+          }
+
+          # "-qgki" and not the full string: the hash comes from the
+          # environment, so this half must match what a stale auto.conf says.
+          check LOCALVERSION "\"$EXPECTED_CONFIG_LOCALVERSION\""
+
+          # The second half of the vermagic string.
+          check SMP y
+          check PREEMPT y
+          check MODULE_UNLOAD y
+          check MODVERSIONS y
+
+          # The Kali chroot. main dropped SYSVIPC and PID_NS to cure the
+          # bootloop, which was a misdiagnosis - the bootloop came from the
+          # forced CRC and vermagic acceptance in kernel/module.c.
+          check SYSVIPC y
+          check IPC_NS y
+          check PID_NS y
+          check NAMESPACES y
+          check USER_NS y
+
+          # Must match the stock kernel, which has both on.
+          check LTO_CLANG y
+          check CFI_CLANG y
+
+          # /vendor_dlkm is erofs and we build that image now. XATTR and
+          # SECURITY make the SELinux labels inside it visible; without them
+          # init cannot read the modules. ZIP is required because mkfs.erofs
+          # compresses with LZ4 by default.
+          check EROFS_FS y
+          check EROFS_FS_XATTR y
+          check EROFS_FS_SECURITY y
+          check EROFS_FS_ZIP y
+
+          # Wi-Fi: the in-tree qcacld-3.0 driver and its platform glue.
+          check STAGING y
+          check QCA_CLD_WLAN m
+          check CFG80211 y
+          check MAC80211 y
+          check ICNSS2 y
+          check CNSS_GENL y
+          check WCNSS_MEM_PRE_ALLOC y
+
+          # Bluetooth: btpower.ko and bt_fm_slim.ko, and bt_fm_slim needs the
+          # SLIMbus core built in.
+          check BT y
+          check ARCH_QCOM y
+          check MSM_BT_POWER m
+          check BTFM_SLIM m
+          check SLIMBUS y
+
+          exit "$fail"
+
+      - name: Export a standalone defconfig
+        run: |
+          set -eu
+          # Reference file for the artifact only. It is NOT part of the
+          # flashable zip and nothing reads it at flash time - build 9 put it
+          # next to the zip and that made it look like it belonged inside.
+          make -j"$(nproc)" O=out ARCH=arm64 $KTC savedefconfig
+          cp out/defconfig nethunter_oscar_defconfig
+          echo "standalone defconfig: $(wc -l < nethunter_oscar_defconfig) lines"
+
+      # dtbo: this tree has no dtbo.img target. arch/arm64/Makefile exposes only
+      # Image / Image.gz / install / vdso. dtbo.img comes from Android mkdtimg,
+      # not from kernel make, so the stock dtbo partition stays untouched.
+      - name: Build kernel and in-tree modules
+        run: |
+          set -eu
+          set -o pipefail
+
+          # Piped through tee so a failure can report itself. Run 32511775897
+          # ended with nothing but "make: *** [Makefile:190: sub-make] Error 2"
+          # at the tail, because with -j the failing recipe's diagnostic is
+          # buried hundreds of lines up.
+          rc=0
+          make -j"$(nproc)" O=out ARCH=arm64 $KTC Image modules 2>&1 \
+            | tee /tmp/build.log || rc=$?
+
+          if [ "$rc" != "0" ]; then
+            echo "### build failed, rc=$rc - digging out the cause"
+
+            echo "=== compiler and linker diagnostics ==="
+            grep -nE ' (error|fatal error):|^ld\.lld: error:|undefined (symbol|reference)|relocation .* (out of range|truncated)|cannot find' \
+              /tmp/build.log | awk 'NR<=60' || echo "  nothing matched"
+
+            echo "=== make failure lines ==="
+            grep -nE '^make(\[[0-9]+\])?: \*\*\*' /tmp/build.log | awk 'NR<=30' || true
+
+            echo "=== context around the first diagnostic ==="
+            n=$(grep -nE ' (error|fatal error):|^ld\.lld: error:' /tmp/build.log \
+              | awk 'NR==1' | cut -d: -f1 || true)
+            if [ -n "${n:-}" ]; then
+              s=1
+              [ "$n" -gt 40 ] && s=$((n - 40))
+              sed -n "${s},$((n + 40))p" /tmp/build.log
+            else
+              echo "  no diagnostic matched - last 150 lines instead:"
+              tail -150 /tmp/build.log
+            fi
+
+            echo "=== log was $(wc -l < /tmp/build.log) lines ==="
+            exit "$rc"
+          fi
+
+          echo "Image  : $(stat -c %s out/arch/arm64/boot/Image) bytes"
+          echo "modules: $(find out -name '*.ko' | wc -l) built"
+
+      # The only adapter here that can do monitor mode and injection.
+      # Out-of-tree drivers regularly fail against LTO/CFI and that must not
+      # throw away a good kernel - so this step may fail, but not SILENTLY. Run
+      # 32518262085 produced one bare "Process completed with exit code 2".
+      - name: Build RTL8188EUS (TL-WN722N v2)
+        id: rtl
+        continue-on-error: true
+        run: |
+          set -eu
+          set -o pipefail
+          git clone --depth=1 https://github.com/aircrack-ng/rtl8188eus.git rtl8188eus
+
+          # Run 32571447245 built this cleanly and it would still have been
+          # refused at insmod time. The script explains why.
+          bash nethunter/patch-rtl8188eus.sh rtl8188eus
+
+          echo "=== platform switches this Makefile defines ==="
+          grep -nE '^CONFIG_PLATFORM_[A-Z0-9_]+' rtl8188eus/Makefile | awk 'NR<=40' || true
+          echo "=== toolchain and recursion lines ==="
+          grep -nE '^(KVER|KSRC|ARCH|SUBARCH|CROSS_COMPILE|MODULE_NAME)|\$\(MAKE\)' \
+            rtl8188eus/Makefile | awk 'NR<=30' || true
+          echo "=== the arm64 platform block we switch on ==="
+          grep -n -A 12 'ifeq ($(CONFIG_PLATFORM_ARM64_RPI), y)' rtl8188eus/Makefile \
+            || echo "  block not found - the switch name below is wrong"
+
+          # Two failed rounds, one root cause:
+          #  1. CONFIG_PLATFORM_ANDROID_ARM64 does not exist in this fork. So
+          #     "I386_PC=n ANDROID_ARM64=y" switched the only active platform
+          #     off and switched nothing on - no platform block ran at all.
+          #  2. Every -DCONFIG_LITTLE_ENDIAN sits inside a platform block, so
+          #     run 32518262085 died on "Must be LITTLE/BIG Endian Host".
+          #  3. Those blocks also supply -DCONFIG_IOCTL_CFG80211, so run
+          #     32569677606 died one wall further along at os_intfs.c:1645 with
+          #     "implicit declaration of function 'wiphy_net'" and "no member
+          #     named 'wiphy' in 'struct _ADAPTER'". include/autoconf.h ships
+          #     that define commented out, so the Makefile is its only source.
+          # ARM64_RPI supplies both, and sets ARCH with ?=, so our ARCH,
+          # CROSS_COMPILE and KSRC still win - command-line variables override
+          # every assignment in a makefile. KCFLAGS repeats both defines
+          # deliberately: duplicate identical -D flags are harmless and it saves
+          # a 26-minute round trip if that block changes.
+          rc=0
+          make -j"$(nproc)" -C rtl8188eus \
+            KSRC="$PWD/out" ARCH=arm64 $KTC \
+            KCFLAGS="-DCONFIG_LITTLE_ENDIAN -DCONFIG_IOCTL_CFG80211 -DRTW_USE_CFG80211_STA_EVENT" \
+            CONFIG_PLATFORM_I386_PC=n CONFIG_PLATFORM_ARM64_RPI=y 2>&1 \
+            | tee /tmp/rtl.log || rc=$?
+
+          if [ "$rc" != "0" ]; then
+            echo "### dongle driver failed, rc=$rc"
+
+            echo "=== compiler and linker diagnostics ==="
+            grep -nE ' (error|fatal error):|^ld\.lld: error:|No such file|undefined (symbol|reference)|Nothing to be done|command not found' \
+              /tmp/rtl.log | awk 'NR<=40' || echo "  nothing matched"
+
+            echo "=== make failure lines ==="
+            grep -nE '^make(\[[0-9]+\])?: \*\*\*' /tmp/rtl.log | awk 'NR<=20' || true
+
+            echo "=== context around the first diagnostic ==="
+            n=$(grep -nE ' (error|fatal error):|^ld\.lld: error:' /tmp/rtl.log \
+              | awk 'NR==1' | cut -d: -f1 || true)
+            if [ -n "${n:-}" ]; then
+              s=1
+              [ "$n" -gt 30 ] && s=$((n - 30))
+              sed -n "${s},$((n + 30))p" /tmp/rtl.log
+            else
+              echo "  no diagnostic matched - tail of the log follows:"
+              tail -120 /tmp/rtl.log
+            fi
+
+            echo "=== log was $(wc -l < /tmp/rtl.log) lines ==="
+            exit "$rc"
+          fi
+
+          ls -l rtl8188eus/8188eu.ko
+
+          # 119 MB unstripped: LTO leaves .llvmbc and .llvmcmd behind.
+          # INSTALL_MOD_STRIP=1 covers the in-tree modules, but this one never
+          # goes through modules_install.
+          llvm-strip --strip-debug rtl8188eus/8188eu.ko
+          echo "  stripped to $(stat -c %s rtl8188eus/8188eu.ko) bytes"
+
+          bad=0
+
+          # Checked on the artifact, not on the patch script's exit code.
+          # Without the import insmod refuses the module outright, because
+          # CONFIG_MODULE_ALLOW_MISSING_NAMESPACE_IMPORTS is off on this device.
+          if modinfo rtl8188eus/8188eu.ko 2>/dev/null | grep -q '^import_ns:'; then
+            echo "  ok    8188eu.ko imports a symbol namespace:"
+            modinfo rtl8188eus/8188eu.ko | grep '^import_ns:'
+          else
+            echo "::error::8188eu.ko carries no import_ns - insmod would refuse it"
+            bad=1
+          fi
+
+          if grep -q 'does not import it' /tmp/rtl.log; then
+            echo "::error::modpost still reports a missing namespace import:"
+            grep 'does not import it' /tmp/rtl.log | awk 'NR<=5'
+            bad=1
+          else
+            echo "  ok    modpost reported no missing namespace imports"
+          fi
+
+          # Building does not prove cfg80211 got compiled in - the driver also
+          # builds wext-only, and in that mode airmon-ng cannot drive it.
+          if strings -a rtl8188eus/8188eu.ko | grep -q cfg80211; then
+            echo "  ok    8188eu.ko carries cfg80211 symbols - nl80211 path is in"
+          else
+            echo "  WARN  no cfg80211 in 8188eu.ko - monitor mode would be wext only"
+          fi
+
+          strings -a rtl8188eus/8188eu.ko | grep -m1 '^vermagic=' || true
+
+          exit "$bad"
+
+      - name: Install and stage modules
+        run: |
+          set -eu
+          make O=out ARCH=arm64 $KTC \
+            INSTALL_MOD_PATH="$PWD/modinstall" INSTALL_MOD_STRIP=1 modules_install
+
+          # Staging lives OUTSIDE AnyKernel3 now. It used to be
+          # AnyKernel3/modules/vendor/lib/modules, which did two bad things at
+          # once: AnyKernel3 pushed those files to
+          # /data/adb/modules/ak3-helper/system/vendor/lib/modules, a path
+          # nothing on this phone reads, and "zip -r9 ." swallowed all 154 MB of
+          # it - that is where the 61 MB artifact came from.
+          DEST=modout
+          rm -rf "$DEST" AnyKernel3/modules
+          mkdir -p "$DEST"
+
+          # EVERY module the build produced. The hand-written allowlist was the
+          # original mistake: it omitted camera.ko and the ~30 audio modules,
+          # which is exactly why camera and sound were dead.
+          find modinstall -name '*.ko' -exec cp -f {} "$DEST/" \;
+
+          # qcacld-3.0 builds in-tree as wlan.o (its Kbuild sets MODNAME := wlan
+          # when MODNAME arrives empty) while the phone loads qca_cld3_wlan.ko.
+          # A plain rename is correct: lsmod on stock reports the module as
+          # "wlan", and modpost bakes KBUILD_MODNAME into
+          # .gnu.linkonce.this_module where a filename cannot reach it. Building
+          # with MODNAME=qca_cld3_wlan would instead DEFINE MULTI_IF_NAME and
+          # send the driver hunting for a firmware directory that does not
+          # exist. Do not "fix" this into an external build.
+          if [ -f "$DEST/wlan.ko" ]; then
+            mv -f "$DEST/wlan.ko" "$DEST/qca_cld3_wlan.ko"
+          fi
+
+          # 8188eu.ko is deliberately NOT staged: it does not fit in
+          # vendor_dlkm and must not be in modules.load. It ships at the zip
+          # root and anykernel.sh drops it in /data/adb/nh.
+
+          echo "=== staged $(ls -1 "$DEST" | wc -l) modules, $(du -sh "$DEST" | cut -f1) ==="
+          ls -1 "$DEST"
+
+      - name: Assert vermagic matches the device byte for byte
+        run: |
+          set -eu
+          DEST=modout
+          echo "device : $EXPECTED_VERMAGIC"
+
+          # Every module, not a single probe. All 39 are about to be sealed
+          # inside a partition image, and one odd module out is a dead subsystem
+          # the erofs verifier cannot see.
+          bad=0
+          none=0
+          n=0
+          for ko in $(find "$DEST" -name '*.ko' | sort); do
+            n=$((n + 1))
+            got=$(strings -a "$ko" | grep -m1 '^vermagic=' | sed 's/^vermagic=//' || true)
+            if [ -z "$got" ]; then
+              echo "  none    $(basename "$ko") exposes no vermagic"
+              none=$((none + 1))
+            elif [ "$got" != "$EXPECTED_VERMAGIC" ]; then
+              echo "::error::$(basename "$ko")"
+              echo "::error::  got  $got"
+              bad=$((bad + 1))
+            fi
+          done
+
+          echo "checked $n modules: $bad wrong, $none without a vermagic string"
+          if [ "$n" = 0 ]; then
+            echo "::error::no modules were staged at all"
+            exit 1
+          fi
+          if [ "$bad" != 0 ]; then
+            echo "::error::$bad modules carry the wrong vermagic"
+            exit 1
+          fi
+          echo "  ok      all $n modules carry the exact device vermagic"
+
+      - name: Verify against the device inventory
+        run: |
+          set -eu
+          DEST=modout
+
+          # A committed file, read out of the untouched partition with an EROFS
+          # parser. Deliberately NOT a here-document: a heredoc body inside a
+          # YAML block scalar has to be indented, which indents its terminator
+          # too, which bash never matches - the heredoc then swallowed the rest
+          # of this step and it passed without checking anything. "bash -n" only
+          # warns about that. A verification step that cannot fail is worse than
+          # none at all.
+          MANIFEST=nethunter/vendor_dlkm/stock-manifest.txt
+
+          echo "=== device /vendor_dlkm/lib/modules vs this build ==="
+          built=0
+          stock=0
+          total=0
+          while IFS= read -r m; do
+            case "$m" in ''|'#'*) continue;; esac
+            total=$((total + 1))
+            if [ -f "$DEST/$m.ko" ]; then
+              echo "  built  $m.ko"
+              built=$((built + 1))
+            else
+              echo "::error::$m.ko was NOT built"
+              stock=$((stock + 1))
+            fi
+          done < "$MANIFEST"
+
+          echo "counted $total device modules: $built rebuilt, $stock missing"
+
+          if [ "$total" != "39" ]; then
+            echo "::error::the manifest holds $total entries, the device has 39"
+            exit 1
+          fi
+
+          # This used to print "STOCK $m.ko (kept - relies on matching
+          # vermagic)" and pass. That encoded a belief that is false: SYSVIPC
+          # and USER_NS change task_struct, genksyms therefore changes the CRC
+          # of every exported symbol that reaches it, and a stock module is
+          # refused with "disagrees about version of symbol" even though its
+          # vermagic matches byte for byte. There is no "kept" case any more.
+          if [ "$stock" != "0" ]; then
+            echo "::error::$stock device modules are missing from this build. They"
+            echo "::error::cannot be left stock - our kernel would refuse them."
+            exit 1
+          fi
+          echo "  ok      all 39 device modules were rebuilt from this tree"
+
+      - name: Build vendor_dlkm.img
+        run: |
+          set -eu
+          REL=$(cat out/include/config/kernel.release)
+          echo "kernel.release: $REL"
+          bash nethunter/build-vendor-dlkm.sh \
+            modout AnyKernel3/vendor_dlkm.img "$REL" out/System.map
+
+      - name: Verify vendor_dlkm.img against the stock partition
+        run: |
+          set -eu
+          # Independent second pass on the finished file, using only the
+          # committed manifest - no knowledge of the staging directory. Last
+          # gate before the zip exists.
+          python3 nethunter/verify-erofs.py assert \
+            AnyKernel3/vendor_dlkm.img "$VENDOR_DLKM_SIZE" \
+            nethunter/vendor_dlkm/stock-manifest.txt
+
+          echo ""
+          python3 nethunter/verify-erofs.py dump AnyKernel3/vendor_dlkm.img
+
+      - name: Assemble the AnyKernel3 zip
+        run: |
+          set -eu
+          cp out/arch/arm64/boot/Image AnyKernel3/Image
+
+          if [ -f rtl8188eus/8188eu.ko ]; then
+            cp -f rtl8188eus/8188eu.ko AnyKernel3/8188eu.ko
+          else
+            echo "  note: the dongle driver did not build - the zip ships without it"
+          fi
+
+          echo "=== what goes into the zip ==="
+          ls -l AnyKernel3/
+
+          cd AnyKernel3
+          zip -r9 "../NetHunter-Kernel-oscar-$(date -u +%Y%m%d-%H%M).zip" . -x '.git/*'
+          cd ..
+          ls -l NetHunter-Kernel-oscar-*.zip
+
+      # Inspects the finished artifact the way it gets inspected before
+      # flashing. Reported, not enforced: the hard gates above already stop a
+      # genuinely broken build. Read this step's log before flashing anything.
+      - name: Verify the finished zip
+        continue-on-error: true
+        run: |
+          set -eu
+          z=$(ls -1 NetHunter-Kernel-oscar-*.zip | awk 'NR==1')
+          bash nethunter-verify-zip.sh "$z"
+
+      - name: Report kernel identity
+        run: |
+          set -eu
+          rel=$(cat out/include/config/kernel.release)
+          echo "release : $rel"
+
+          # Build 9 printed "Linux version %s (%s)" here and it looked like the
+          # release string had been lost. It had not - that is linux_proc_banner,
+          # the format string behind /proc/version, and a bare
+          # grep 'Linux version' hits it first. grep -F on the full expected
+          # release finds linux_banner instead, turning a cosmetic confusion
+          # into an actual assertion.
+          if strings -a out/arch/arm64/boot/Image | grep -m1 -F "Linux version $rel"; then
+            echo "  ok      Image carries the expected release string"
+          else
+            echo "::error::Image does not contain 'Linux version $rel'"
+            strings -a out/arch/arm64/boot/Image | grep -m3 'Linux version' || true
+            exit 1
+          fi
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: NetHunter-Kernel-oscar
+          path: |
+            NetHunter-Kernel-oscar-*.zip
+            nethunter_oscar_defconfig
+            out/.config

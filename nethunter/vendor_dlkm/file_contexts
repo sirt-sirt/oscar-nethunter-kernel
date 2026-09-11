@@ -1,0 +1,28 @@
+# SELinux labels for the rebuilt vendor_dlkm image.
+#
+# Read out of the stock partition's shared-xattr table, not guessed:
+#   47 entries  u:object_r:vendor_file:s0          (/, /lib, /lib/modules, all
+#                                                   39 .ko, all modules.* files)
+#    5 entries  u:object_r:vendor_configs_file:s0  (/etc and its four files)
+#
+# Get this wrong and init cannot read the modules, so nothing loads and the
+# phone boots with no camera, no audio, no Wi-Fi and no Bluetooth - the exact
+# symptom we are trying to avoid, arrived at by a different road.
+#
+# Both prefix forms are listed on purpose. mkfs.erofs matches these regexes
+# against paths as they appear inside the image, which is root-relative
+# ("/lib/modules/camera.ko") unless it is given a mount point, in which case it
+# is "/vendor_dlkm/lib/modules/camera.ko". Whether the Ubuntu build supports
+# --mount-point is not worth a 26-minute round trip to find out, so cover both.
+# The unused half simply never matches. nethunter/verify-erofs.py reads the
+# labels back out of the finished image and fails the build if they are wrong.
+
+/                              u:object_r:vendor_file:s0
+/lib                           u:object_r:vendor_file:s0
+/lib/modules(/.*)?             u:object_r:vendor_file:s0
+/etc                           u:object_r:vendor_configs_file:s0
+/etc/.*                        u:object_r:vendor_configs_file:s0
+
+/vendor_dlkm                   u:object_r:vendor_file:s0
+/vendor_dlkm/lib(/.*)?         u:object_r:vendor_file:s0
+/vendor_dlkm/etc(/.*)?         u:object_r:vendor_configs_file:s0
