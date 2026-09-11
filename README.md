@@ -2,91 +2,104 @@
 
 # NetHunter Kernel · Realme 9 Pro 5G (`oscar`)
 
-**Кастомное ядро Linux 5.4.280-qgki с поддержкой Kali NetHunter**
+A custom Linux 5.4.280-qgki kernel that adds **Kali NetHunter** support
+to the phone — without breaking anything a daily driver needs.
 
 [![Build](https://github.com/sirt-sirt/oscar-nethunter-kernel/actions/workflows/build-kernel.yml/badge.svg)](https://github.com/sirt-sirt/oscar-nethunter-kernel/actions/workflows/build-kernel.yml)
 [![License](https://img.shields.io/badge/license-GPL--2.0-blue)](LICENSE)
 ![Kernel](https://img.shields.io/badge/kernel-5.4.280--qgki-green)
 ![CFI](https://img.shields.io/badge/CFI-strict%20·%20passing-success)
 
+**English** · [Русский](README.ru.md)
+
 </div>
 
 ---
 
-## Что это
+## What is this?
 
-Патченное ядро для **Realme 9 Pro 5G** (кодовое имя `oscar`, SoC Qualcomm Snapdragon 695 5G / `sm6375` / `holi`, база LineageOS 21 / Android 14), добавляющее поддержку окружения **Kali NetHunter**:
+Realme 9 Pro 5G (Snapdragon 695 5G, `sm6375` / `holi`, LineageOS 21 / Android 14)
+ships with a Qualcomm stock kernel that has `CONFIG_SYSVIPC` and user namespaces
+**disabled** — with that kernel, a Kali NetHunter chroot simply cannot work.
 
-- полноценный chroot: Linux-namespaces и SysVIPC;
-- внешнее USB-железо по OTG (Wi-Fi адаптеры, serial-устройства, Bluetooth-донглы).
+This project is a patched kernel that enables what NetHunter needs, plus the
+build tooling to keep the rest of the system exactly as stock:
 
-Телефон при этом остаётся телефоном: Wi-Fi, Bluetooth, камера, звук и сотовая сеть работают штатно.
+| | Stock kernel | This kernel |
+|---|---|---|
+| Kali chroot (namespaces, SysVIPC) | ✗ | ✓ |
+| Wi-Fi, Bluetooth, camera, sound, cellular | ✓ | ✓ (unchanged) |
+| Strict clang CFI + LTO | ✓ | ✓ (preserved, no PERMISSIVE) |
+| USB OTG: serial/ACM, Bluetooth dongles | partial | ✓ |
 
-## Ключевые особенности
+## What's inside
 
-### Совместимость Kali chroot
-`CONFIG_SYSVIPC=y`, полная изоляция namespace'ами (`PID_NS`, `NET_NS`, `USER_NS`, `IPC_NS`, `UTS_NS`) — chroot NetHunter работает без ограничений.
+- **Kernel config fragment** — `arch/arm64/configs/vendor/nethunter_oscar.config`,
+  ~80 `CONFIG_` changes over the stock `holi-qgki_defconfig`.
+- **Full vendor module rebuild.** The subtle part of this device: `/vendor/lib/modules`
+  is a symlink to a **read-only `vendor_dlkm` (EROFS) partition**, so Magisk systemless
+  overlays can't reach it. Enabling `SYSVIPC`/`USER_NS` changes `task_struct`, which shifts
+  symbol CRCs — stock modules would refuse to load even with a matching vermagic.
+  So all **39 vendor modules are rebuilt from the same tree** as the kernel and packed
+  into a fresh `vendor_dlkm.img` with proper SELinux labels. Vermagic and CRCs match
+  by construction.
+- **Gated CI pipeline** (~26 min): release string and critical symbols checked *before*
+  the build, per-module vermagic *after*, cross-check against the 39-module device
+  inventory, double EROFS image verification. A leftover stock module is a hard failure,
+  not a warning.
 
-### Внешние USB-устройства
-- USB Serial / ACM (`CONFIG_USB_ACM`, `CONFIG_USB_SERIAL`, чипы `PL2303`, `FTDI_SIO`, `CH341`, `CP210X`);
-- внешние USB Bluetooth-адаптеры (`CONFIG_BT_HCIBTUSB`, `BT_BNEP`);
-- `CFG80211_WEXT` — совместимость с классическими wireless-утилитами.
+## Build (GitHub Actions)
 
-> ⚠️ **Некоторые внешние Wi-Fi-свистки могут крашить систему.** Драйверы out-of-tree на этом ядре (strict CFI + LTO) при несовпадении сигнатур колбэков приводят к kernel panic. Поэтому драйвер внешнего адаптера грузится **только вручную** и живёт вне всех загрузочных путей — на загрузку телефона он повлиять не может в принципе. Свисток подключайте осознанно.
+No local Linux needed — everything builds in CI:
 
-Для TP-Link TL-WN722N v2 (чип Realtek RTL8188EUS, USB ID `2357:010c`) в репозитории есть патч-скрипт, приводящий драйвер к строгому CFI — он собирается в CI и кладётся в архив отдельным модулем.
-
-### Строгий CFI + LTO сохранены
-`CONFIG_CFI_CLANG=y + LTO` включены, как у стока Qualcomm, и проходят без послаблений — `CONFIG_CFI_PERMISSIVE` не нужен. Все правки типизированы честно, касты, глушащие компилятор, удалены.
-
-### Инженерная доставка модулей (главное отличие)
-`/vendor/lib/modules` на этом устройстве — **симлинк на read-only раздел `vendor_dlkm` (EROFS)**, поэтому systemless-оверлеи Magisk туда не добивают. Решение:
-
-1. **Все 39 вендорных модулей пересобираются из этого же дерева** (включая Wi-Fi встройки `qcacld-3.0` → `qca_cld3_wlan.ko`) и пакуются в `vendor_dlkm.img` с SELinux-метками (патченный `erofs-utils`).
-2. CI **фатально падает**, если хоть один стоковый модуль остался «стоковым» — с включёнными SYSVIPC/USER_NS сдвигаются CRC `task_struct`, и стоковый модуль не загрузится даже при совпадающем vermagic.
-3. AnyKernel3 трогает только `boot` (подмена ядра, Magisk переживает прошивку), `do.modules=0`.
-
-## Сборка (GitHub Actions)
-
-Локальная Linux-машина не нужна — всё собирает CI (~26 минут), с гейтами на каждом шаге: проверка release-строки и критичных символов **до** сборки, vermagic каждого `.ko` **после**, сверка с инвентарём 39 модулей устройства, двойная верификация EROFS-образа и готового зипа.
-
-1. Форкните репозиторий.
-2. Вкладка **Actions** → включить workflows.
+1. Fork the repository.
+2. **Actions** tab → enable workflows.
 3. **Build NetHunter Kernel (oscar)** → *Run workflow*.
-4. Скачать артефакт `NetHunter-Kernel-oscar`.
+4. Download the `NetHunter-Kernel-oscar` artifact (contains the AnyKernel3 zip
+   and the standalone defconfig).
 
-## Установка
+## Install
 
-> Требуется разблокированный загрузчик и root (Magisk). Всё, что вы делаете, — на ваш риск.
+> Requires an unlocked bootloader and root (Magisk). You do this at your own risk.
 
-1. Скачать артефакт из Actions (или [Releases](../../releases)) и **распаковать один раз** — внутри настоящий `NetHunter-Kernel-oscar-*.zip`.
-2. Сделать бэкап текущего `boot`:
+1. Download the artifact and **unpack it once** — inside is the real
+   `NetHunter-Kernel-oscar-*.zip`.
+2. Back up the current `boot`:
    ```bash
    su -c 'dd if=/dev/block/by-name/boot$(getprop ro.boot.slot_suffix) of=/sdcard/boot-backup.img'
    ```
-3. Прошить внутренний zip через **Kernel Flasher** (capntrips) из загруженного Android. Шить **только в активный слот**.
+3. Flash the inner zip with **Kernel Flasher** (capntrips) from booted Android,
+   active slot only. AnyKernel3 replaces only the kernel inside `boot` —
+   Magisk and recovery survive.
 
-**Откат:** `fastboot set_active b` (в слоте B остаётся копия рабочего загрузчика) либо `fastboot flash boot boot-backup.img` из fastbootd.
+**Rollback:** `fastboot set_active b` (slot B holds a copy of the working bootloader)
+or `fastboot flash boot boot-backup.img` from fastbootd.
 
-### После OTA LineageOS
-OTA перезаписывает `boot` — ядро нужно прошить заново (Magisk → *Install to Inactive Slot (After OTA)* → ребут → Kernel Flasher).
+**After an OTA update:** OTA overwrites `boot` — re-flash the kernel
+(Magisk → *Install to Inactive Slot (After OTA)* → reboot → Kernel Flasher).
 
-## Структура репозитория
+## Known limitations
 
-| Путь | Что это |
+- External USB Wi-Fi adapters may crash the system: out-of-tree drivers under
+  strict CFI panic on callback signature mismatch. Such drivers, if built at all,
+  ship as separate modules loaded **manually** — they live outside all boot paths
+  and cannot affect boot. Plug external adapters deliberately.
+- After every LineageOS OTA the kernel must be re-flashed (see above).
+
+## Repository layout
+
+| Path | What |
 |---|---|
-| `arch/arm64/configs/vendor/nethunter_oscar.config` | конфиг-фрагмент NetHunter поверх `holi-qgki_defconfig` |
-| `nethunter/patch-rtl8188eus.sh` | патч драйвера RTL8188EUS под строгий CFI (идемпотентный, loud-fail) |
-| `nethunter/build-vendor-dlkm.sh` | сборка `vendor_dlkm.img` (EROFS + SELinux-метки) |
-| `nethunter/verify-erofs.py` | независимый верификатор EROFS-образа |
-| `nethunter/vendor_dlkm/` | манифест 39 стоковых модулей, `modules.load/softdep/blocklist`, `file_contexts`, `build.prop` |
-| `nethunter/ci/build-kernel.yml` | CI-конвейер |
-| `AnyKernel3/` | упаковка и прошивка |
+| `arch/arm64/configs/vendor/nethunter_oscar.config` | NetHunter config fragment |
+| `nethunter/` | CI tooling: `vendor_dlkm.img` builder, EROFS verifier, out-of-tree driver CFI patches |
+| `nethunter/vendor_dlkm/` | device module manifest, load/softdep/block lists, SELinux `file_contexts` |
+| `nethunter/ci/build-kernel.yml` | CI pipeline |
+| `AnyKernel3/` | packaging and flashing |
 
-## Версии
+## Releases
 
-Смотри [Releases](../../releases) — каждый релиз соответствует проверенной на устройстве сборке.
+See [Releases](../../releases) — each release corresponds to a build validated on real hardware.
 
-## Лицензия
+## License
 
-GPL-2.0 — унаследована от ядра Linux.
+GPL-2.0, inherited from the Linux kernel.
